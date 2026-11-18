@@ -7,6 +7,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 
+import {stripeConfigured, stripeCurrency, stripeRequest, verifyWebhookSignature} from './stripe.mjs';
+
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = path.join(ROOT, 'data');
@@ -31,6 +33,9 @@ const GIFTS = [
   {id: 'rocket', label: 'صاروخ', emoji: '🚀', coins: 99},
   {id: 'crown', label: 'تاج', emoji: '👑', coins: 499},
 ];
+
+// أسعار الاشتراكات بالوحدة الصغرى للعملة (هللة/سنت) — تُدفع بالبطاقة عبر Stripe.
+const TIER_PRICES = {basic: 900, plus: 2900, vip: 7900};
 
 const TIERS = [
   {id: 'basic', name: 'أساسي', coins: 99, perks: 'شارة المشترك + منشورات خاصة'},
@@ -207,6 +212,8 @@ try {
 }
 await fsp.mkdir(UPLOAD_DIR, {recursive: true});
 
+db.payments = db.payments || [];
+
 let saveChain = Promise.resolve();
 function save() {
   const snapshot = JSON.stringify(db, null, 2);
@@ -262,6 +269,55 @@ function findPost(id) {
   return db.posts.find((p) => p.id === id);
 }
 
+function publicState() {
+  return {
+    ...db,
+    payments: {configured: stripeConfigured(), currency: stripeCurrency()},
+    tierPrices: TIER_PRICES,
+  };
+}
+
+function siteOrigin(req) {
+  const origin = req.headers.origin;
+  if (origin && /^https?:\/\/[^/]+$/.test(origin)) return origin;
+  return `http://${req.headers.host || `localhost:${PORT}`}`;
+}
+
+// تُستدعى مرة واحدة لكل جلسة دفع: تضيف الكوينز أو تفعّل الاشتراك.
+async function fulfillSession(session) {
+  const sessionId = session.id;
+  if (!sessionId) return null;
+  const meta = session.metadata || {};
+  if (db.payments.some((entry) => entry.sessionId === sessionId)) return meta.kind || null;
+
+  if (meta.kind === 'coins') {
+    const pack = PACKAGES.find((p) => p.id === meta.packageId);
+    if (!pack) return null;
+    const total = pack.coins + pack.bonus;
+    db.me.coins += total;
+    db.transactions.unshift({
+      id: uid('tx'),
+      type: 'buy',
+      label: `شراء ${pack.coins} كوين — بطاقة`,
+      amount: total,
+      at: iso(),
+    });
+  } else if (meta.kind === 'subscription') {
+    const creator = creatorById(meta.creatorId);
+    const tier = creator?.tiers?.find((t) => t.id === meta.tierId);
+    if (!creator || !tier) return null;
+    db.me.subscriptions = db.me.subscriptions.filter((sub) => sub.creatorId !== creator.id);
+    db.me.subscriptions.push({creatorId: creator.id, tierId: tier.id, tierName: tier.name, at: iso()});
+    if (!db.me.following.includes(creator.id)) db.me.following.push(creator.id);
+  } else {
+    return null;
+  }
+
+  db.payments.push({sessionId, kind: meta.kind, at: iso()});
+  await save();
+  return meta.kind;
+}
+
 function spend(amount, label, type) {
   if (db.me.coins < amount) return false;
   db.me.coins -= amount;
@@ -286,7 +342,7 @@ async function handleApi(req, res, url) {
   const parts = pathname.split('/').filter(Boolean); // ['api', ...]
 
   if (method === 'GET' && pathname === '/api/health') return sendJson(res, 200, {ok: true});
-  if (method === 'GET' && pathname === '/api/state') return sendJson(res, 200, db);
+  if (method === 'GET' && pathname === '/api/state') return sendJson(res, 200, publicState());
 
   // نشر مقطع
   if (method === 'POST' && pathname === '/api/posts') {
@@ -382,19 +438,87 @@ async function handleApi(req, res, url) {
     await save();
     return sendJson(res, 200, {ok: true, following: !following, followers: creator.followers, me: db.me});
   }
-  if (method === 'POST' && parts[1] === 'creators' && parts[3] === 'subscribe') {
-    const creator = creatorById(parts[2]);
-    if (!creator) return sendJson(res, 404, {error: 'not_found'});
+  // ------- الدفع الحقيقي عبر Stripe -------
+  if (method === 'POST' && pathname === '/api/checkout/coins') {
+    if (!stripeConfigured()) return sendJson(res, 503, {error: 'payments_not_configured'});
     const body = await readJson(req);
-    const tier = (creator.tiers || []).find((t) => t.id === body.tierId);
-    if (!tier) return sendJson(res, 400, {error: 'bad_tier'});
-    if (db.me.coins < tier.coins) return sendJson(res, 402, {error: 'not_enough_coins', coins: db.me.coins});
-    spend(tier.coins, `اشتراك ${tier.name} — ${creator.name}`, 'subscribe');
-    db.me.subscriptions = db.me.subscriptions.filter((s) => s.creatorId !== creator.id);
-    db.me.subscriptions.push({creatorId: creator.id, tierId: tier.id, tierName: tier.name, at: iso()});
-    if (!db.me.following.includes(creator.id)) db.me.following.push(creator.id);
-    await save();
-    return sendJson(res, 200, {ok: true, me: db.me, subscriptions: db.me.subscriptions});
+    const pack = PACKAGES.find((item) => item.id === body.packageId);
+    if (!pack) return sendJson(res, 400, {error: 'bad_package'});
+    const origin = siteOrigin(req);
+    const session = await stripeRequest('/checkout/sessions', {
+      mode: 'payment',
+      success_url: `${origin}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/?checkout=cancel`,
+      line_items: [
+        {
+          price_data: {
+            currency: stripeCurrency(),
+            unit_amount: pack.price * 100,
+            product_data: {name: `${pack.coins} كوين — فيديو قصيرة`},
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {kind: 'coins', packageId: pack.id},
+    });
+    return sendJson(res, 200, {ok: true, url: session.url});
+  }
+
+  if (method === 'POST' && pathname === '/api/checkout/subscription') {
+    if (!stripeConfigured()) return sendJson(res, 503, {error: 'payments_not_configured'});
+    const body = await readJson(req);
+    const creator = creatorById(body.creatorId);
+    const tier = creator?.tiers?.find((item) => item.id === body.tierId);
+    const amount = tier ? TIER_PRICES[tier.id] : null;
+    if (!creator || !tier || !amount) return sendJson(res, 400, {error: 'bad_tier'});
+    const origin = siteOrigin(req);
+    const session = await stripeRequest('/checkout/sessions', {
+      mode: 'subscription',
+      success_url: `${origin}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/?checkout=cancel`,
+      line_items: [
+        {
+          price_data: {
+            currency: stripeCurrency(),
+            unit_amount: amount,
+            recurring: {interval: 'month'},
+            product_data: {name: `اشتراك ${tier.name} — ${creator.name}`},
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {kind: 'subscription', creatorId: creator.id, tierId: tier.id},
+    });
+    return sendJson(res, 200, {ok: true, url: session.url});
+  }
+
+  if (method === 'POST' && pathname === '/api/checkout/confirm') {
+    if (!stripeConfigured()) return sendJson(res, 503, {error: 'payments_not_configured'});
+    const body = await readJson(req);
+    if (!body.sessionId) return sendJson(res, 400, {error: 'session_required'});
+    const session = await stripeRequest(`/checkout/sessions/${encodeURIComponent(body.sessionId)}`, {}, 'GET');
+    if (session.status !== 'complete') return sendJson(res, 400, {error: 'not_completed'});
+    const kind = await fulfillSession(session);
+    return sendJson(res, 200, {ok: true, kind, me: db.me, subscriptions: db.me.subscriptions});
+  }
+
+  if (method === 'POST' && pathname === '/api/stripe/webhook') {
+    const raw = await readBody(req);
+    const text = raw.toString('utf8');
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (secret && !verifyWebhookSignature(text, req.headers['stripe-signature'], secret)) {
+      return sendJson(res, 400, {error: 'bad_signature'});
+    }
+    let event = {};
+    try {
+      event = JSON.parse(text || '{}');
+    } catch {
+      return sendJson(res, 400, {error: 'bad_payload'});
+    }
+    if (event.type === 'checkout.session.completed' && event.data?.object) {
+      await fulfillSession(event.data.object);
+    }
+    return sendJson(res, 200, {received: true});
   }
 
   // غرف الدردشة
@@ -459,24 +583,6 @@ async function handleApi(req, res, url) {
     });
     await save();
     return sendJson(res, 200, {ok: true, me: db.me, chat: live.chat});
-  }
-
-  // المحفظة
-  if (method === 'POST' && pathname === '/api/wallet/buy') {
-    const body = await readJson(req);
-    const pack = PACKAGES.find((p) => p.id === body.packageId);
-    if (!pack) return sendJson(res, 400, {error: 'bad_package'});
-    const total = pack.coins + pack.bonus;
-    db.me.coins += total;
-    db.transactions.unshift({
-      id: uid('tx'),
-      type: 'buy',
-      label: `شراء ${pack.coins} كوين (دفع تجريبي)`,
-      amount: total,
-      at: iso(),
-    });
-    await save();
-    return sendJson(res, 200, {ok: true, me: db.me, transactions: db.transactions});
   }
 
   return sendJson(res, 404, {error: 'not_found'});

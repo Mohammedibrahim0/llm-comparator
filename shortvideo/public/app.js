@@ -16,6 +16,12 @@ const nf = (n = 0) => Number(n).toLocaleString('en-US');
 const esc = (value = '') =>
   String(value).replace(/[&<>"']/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
 
+const CURRENCY_LABELS = {sar: 'ر.س', usd: '$', aed: 'د.إ', egp: 'ج.م', qar: 'ر.ق', kwd: 'د.ك'};
+const money = (major, currency = 'sar') => {
+  const label = CURRENCY_LABELS[currency] || String(currency).toUpperCase();
+  return label === '$' ? `$${major}` : `${major} ${label}`;
+};
+
 const ICONS = {
   home: '<path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/>',
   compass: '<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/>',
@@ -564,12 +570,14 @@ function creatorHTML(id) {
 
 /* ---------------- wallet ---------------- */
 function walletHTML() {
+  const pay = S.data.payments || {configured: false, currency: 'sar'};
   return `<div class="page">
     <div class="balance-card">
       <span>رصيدك الحالي</span>
       <b>🪙 ${nf(S.data.me.coins)}</b>
       <span>كوين — يُستخدم للهدايا والاشتراك في الصفحات المشهورة</span>
     </div>
+    ${pay.configured ? '' : `<p class="note warn">بوابة الدفع غير مُفعّلة بعد — أضف مفتاح Stripe من الإعدادات لتفعيل الشراء الحقيقي.</p>`}
     <div class="section-head"><h3>حزم الكوينز</h3></div>
     <div class="packages">
       ${S.data.packages
@@ -577,12 +585,12 @@ function walletHTML() {
           (pack) => `<button class="pack" data-act="buy" data-id="${pack.id}" data-testid="buy-${pack.id}">
             <b>${nf(pack.coins)} كوين</b>
             <span>${esc(pack.label)}${pack.bonus ? ` · +${pack.bonus} هدية` : ''}</span>
-            <em>${pack.price} ر.س</em>
+            <em>${money(pack.price, pay.currency)}</em>
           </button>`,
         )
         .join('')}
     </div>
-    <p class="note">الدفع الحالي تجريبي ولا يخصم أي مبلغ. في المرحلة المتقدمة سيتم ربط بوابة الدفع لشراء الكوينز والاشتراك في الصفحات المشهورة.</p>
+    <p class="note">الدفع يتم عبر Stripe بالبطاقة، وتُضاف الكوينز إلى رصيدك مباشرة بعد إتمام العملية.</p>
     <div class="section-head"><h3>سجل العمليات</h3></div>
     ${S.data.transactions
       .map(
@@ -634,16 +642,17 @@ function openComments(postId) {
   setTimeout(() => document.querySelector('[data-testid="comment-input"]')?.focus(), 50);
 }
 
-function openPay(packageId) {
-  const pack = S.data.packages.find((item) => item.id === packageId);
-  if (!pack) return;
-  const total = pack.coins + pack.bonus;
-  openSheet(`<div class="sheet-grip"></div>
-    <h3>تأكيد الشراء</h3>
-    <div class="pay-summary"><span>${nf(pack.coins)} كوين${pack.bonus ? ` + ${pack.bonus} هدية` : ''}</span><b>${pack.price} ر.س</b></div>
-    <p class="note">دفع تجريبي — لن يتم خصم أي مبلغ فعلي. ستُضاف ${nf(total)} كوين إلى رصيدك مباشرة.</p>
-    <button class="btn primary block" data-act="confirm-buy" data-id="${pack.id}" data-testid="confirm-buy">تأكيد الدفع</button>
-    <button class="btn ghost block" data-act="close-sheet">إلغاء</button>`);
+async function startCheckout(path, body) {
+  if (!S.data.payments?.configured) {
+    toast('بوابة الدفع غير مُفعّلة بعد');
+    return;
+  }
+  const result = await api(path, body);
+  if (!result.url) {
+    toast('تعذّر بدء عملية الدفع');
+    return;
+  }
+  window.location.href = result.url;
 }
 
 function openTiers(creatorId) {
@@ -655,11 +664,11 @@ function openTiers(creatorId) {
         (tier) => `<div class="tier">
           <div class="avatar" style="border-color:${creator.color}">⭐</div>
           <div class="who"><b>${esc(tier.name)}</b><span>${esc(tier.perks)}</span></div>
-          <button class="btn primary" data-act="subscribe" data-id="${creator.id}" data-tier="${tier.id}" data-testid="tier-${tier.id}">${tier.coins} 🪙</button>
+          <button class="btn primary" data-act="subscribe" data-id="${creator.id}" data-tier="${tier.id}" data-testid="tier-${tier.id}">${money((S.data.tierPrices?.[tier.id] || 0) / 100, S.data.payments?.currency)}</button>
         </div>`,
       )
       .join('')}
-    <p class="note">الاشتراك شهري بالكوينز ويمنحك شارة بجانب اسمك في البث والغرف.</p>`);
+    <p class="note">اشتراك شهري بالبطاقة عبر Stripe، ويتجدد تلقائياً ويمنحك شارة بجانب اسمك في البث والغرف.</p>`);
 }
 
 function openNewRoom() {
@@ -734,7 +743,7 @@ document.addEventListener('click', async (event) => {
     if (act === 'live') return navigate({name: 'live', id});
     if (act === 'new-room') return openNewRoom();
     if (act === 'tiers') return openTiers(id);
-    if (act === 'buy') return openPay(id);
+    if (act === 'buy') return startCheckout('/api/checkout/coins', {packageId: id});
 
     if (act === 'like') {
       const result = await api(`/api/posts/${id}/like`);
@@ -794,24 +803,8 @@ document.addEventListener('click', async (event) => {
       }
       return;
     }
-    if (act === 'confirm-buy') {
-      const result = await api('/api/wallet/buy', {packageId: id});
-      S.data.me = result.me;
-      S.data.transactions = result.transactions;
-      closeSheet();
-      updateCoins();
-      if (S.route.name === 'wallet') render();
-      toast(`تمت إضافة الكوينز 🪙 (دفع تجريبي)`);
-      return;
-    }
     if (act === 'subscribe') {
-      const result = await api(`/api/creators/${id}/subscribe`, {tierId: target.dataset.tier});
-      S.data.me = result.me;
-      closeSheet();
-      updateCoins();
-      render();
-      toast('تم تفعيل الاشتراك ⭐');
-      return;
+      return startCheckout('/api/checkout/subscription', {creatorId: id, tierId: target.dataset.tier});
     }
     if (act === 'gift') {
       const result = await api(`/api/lives/${id}/gift`, {giftId: target.dataset.gift});
@@ -929,7 +922,30 @@ document.addEventListener('keydown', (event) => {
 });
 
 /* ---------------- boot ---------------- */
+async function handleCheckoutReturn() {
+  const params = new URLSearchParams(window.location.search);
+  const status = params.get('checkout');
+  if (!status) return;
+  window.history.replaceState({}, '', '/');
+  if (status === 'cancel') {
+    toast('تم إلغاء عملية الدفع');
+    return;
+  }
+  const sessionId = params.get('session_id');
+  if (!sessionId) return;
+  try {
+    const result = await api('/api/checkout/confirm', {sessionId});
+    await loadState();
+    render();
+    toast(result.kind === 'subscription' ? 'تم تفعيل اشتراكك ✅' : 'تمت إضافة الكوينز 🪙');
+  } catch (error) {
+    toast('تعذّر تأكيد عملية الدفع — تواصل مع الدعم');
+    console.error(error);
+  }
+}
+
 (async () => {
   await loadState();
   render();
+  await handleCheckoutReturn();
 })();

@@ -9,6 +9,9 @@ services:
       - PORT=3000
       - BASE44_PREVIEW_MODE
       - NODE_ENV=development
+      - PAYMENT_CURRENCY=sar
+    env_file:
+      - /run/base44/app.env
     ports:
       - "3000:3000"
     volumes:

@@ -1323,6 +1323,12 @@ textarea {
   padding: 10px 12px;
 }
 
+.note.warn {
+  border-color: rgba(254, 44, 85, 0.45);
+  background: rgba(254, 44, 85, 0.08);
+  color: #ffb3c1;
+}
+
 .tx-row {
   display: flex;
   align-items: center;
