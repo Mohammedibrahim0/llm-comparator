@@ -13,6 +13,7 @@ website/www/**
 docs/documentation/.buildinfo
 docs/documentation/.doctrees/**
 
+shortvideo/data/
 **/.DS_Store
 .dalle-venv/
 .tydi-venv/
